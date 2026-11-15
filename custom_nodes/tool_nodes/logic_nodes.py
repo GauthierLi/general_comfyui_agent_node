@@ -1,0 +1,1821 @@
+"""Easy-Use logic nodes (py/nodes/logic.py, commit 595e073) ported into tool_nodes.
+
+Node algorithms are kept verbatim. Package-only helpers (cache, log, math,
+utils) are inlined below, and every node category is set to 工具.
+"""
+
+import csv
+import gc
+import json
+import math
+import os
+import re
+import time
+from decimal import Decimal, getcontext
+from typing import Any, Dict, Iterator, List, Tuple, Union
+
+import numpy as np
+import torch
+import comfy.utils
+import folder_paths
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
+from comfy.sdxl_clip import SDXLClipG, SDXLClipModel, SDXLRefinerClipModel
+from nodes import MAX_RESOLUTION, NODE_CLASS_MAPPINGS as ALL_NODE_CLASS_MAPPINGS
+from comfy_api.latest import io
+from comfy_execution.graph import ExecutionBlocker
+from comfy_execution.graph_utils import GraphBuilder, is_link
+
+MAX_FLOW_NUM = 20
+DEFAULT_FLOW_NUM = 2
+
+# kept for legacy compatibility but no longer used in node definitions
+
+
+class AlwaysEqualProxy(str):
+    def __eq__(self, _):
+        return True
+
+    def __ne__(self, _):
+        return False
+
+
+class TautologyStr(str):
+    def __ne__(self, other):
+        return False
+
+
+class ByPassTypeTuple(tuple):
+    def __getitem__(self, index):
+        if index > 0:
+            index = 0
+        item = super().__getitem__(index)
+        if isinstance(item, str):
+            return TautologyStr(item)
+        return item
+
+
+any_type = AlwaysEqualProxy("*")
+lazy_options = {"lazy": True}
+
+
+def log_node_info(node_name, message=None):
+    print(f"[EasyUse] {node_name}: {message}" if message is not None else f"[EasyUse] {node_name}")
+
+
+def log_node_warn(node_name, message=None):
+    print(f"[EasyUse] {node_name}: {message}" if message is not None else f"[EasyUse] {node_name}")
+
+
+# Easy-Use 内部 TaggedCache 的最小化移植：clearCacheKey/clearCacheAll 只需要按 key 清除。
+_cache = {}
+_cache_count = {}
+
+
+def remove_cache(key):
+    if key == "*":
+        _cache.clear()
+        _cache_count.clear()
+    elif key in _cache:
+        del _cache[key]
+        _cache_count.pop(key, None)
+    else:
+        print(f"invalid {key}")
+
+
+def cleanGPUUsedForce():
+    remove_cache("*")
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def evaluate_formula(formula, a=0, b=0, c=0, d=0):
+    safe_dict = {
+        'abs': abs, 'pow': pow, 'round': round,
+        'ceil': math.ceil, 'floor': math.floor, 'sqrt': math.sqrt,
+        'exp': math.exp, 'log': math.log, 'log10': math.log10,
+        'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+        'asin': math.asin, 'acos': math.acos, 'atan': math.atan,
+        'pi': math.pi, 'e': math.e,
+    }
+
+    variables = {'a': a, 'b': b, 'c': c, 'd': d}
+    list_inputs = {k: v for k, v in variables.items() if isinstance(v, (list, tuple))}
+    scalar_inputs = {k: v for k, v in variables.items() if not isinstance(v, (list, tuple))}
+
+    def _eval_single(vals):
+        env = dict(safe_dict)
+        env.update({k: float(v) for k, v in vals.items()})
+        try:
+            result = eval(formula, {"__builtins__": {}}, env)
+            return float(result)
+        except Exception as error:
+            raise ValueError(f"公式计算错误: {str(error)}")
+
+    if not list_inputs:
+        return _eval_single(variables)
+
+    max_len = max(len(v) for v in list_inputs.values())
+    results = []
+    for i in range(max_len):
+        vals = {k: float(v) for k, v in scalar_inputs.items()}
+        for k, v in list_inputs.items():
+            vals[k] = float(v[i] if i < len(v) else v[-1])
+        results.append(_eval_single(vals))
+    return results
+
+
+BASE_RESOLUTIONS = [
+    ("width", "height"),
+    (512, 512), (512, 768), (576, 1024), (768, 512), (768, 768), (768, 1024),
+    (768, 1280), (832, 1216), (896, 1152), (1024, 576), (1024, 1024),
+    (1024, 1280), (1152, 896), (1216, 832), (1280, 768), (1280, 1024),
+    (1344, 768), (1536, 640), (1600, 640), (1664, 576), (1920, 512),
+]
+
+
+def validate_list_args(args: Dict[str, List[Any]]) -> Tuple[bool, None, None]:
+    if len(args) == 1:
+        return True, None, None
+    len_to_match = None
+    matched_arg_name = None
+    for arg_name, arg in args.items():
+        if arg_name == "self":
+            continue
+        if len(arg) != 1:
+            if len_to_match is None:
+                len_to_match = len(arg)
+                matched_arg_name = arg_name
+            elif len(arg) != len_to_match:
+                return False, arg_name, matched_arg_name
+    return True, None, None
+
+
+def error_if_mismatched_list_args(args: Dict[str, List[Any]]) -> None:
+    is_valid, failed_key1, failed_key2 = validate_list_args(args)
+    if not is_valid:
+        assert failed_key1 is not None
+        assert failed_key2 is not None
+        raise ValueError(
+            f"Mismatched list inputs received. {failed_key1}({len(args[failed_key1])}) !== {failed_key2}({len(args[failed_key2])})"
+        )
+
+
+def zip_with_fill(*lists: Union[List[Any], None]) -> Iterator[Tuple[Any, ...]]:
+    max_len = max(len(lst) if lst is not None else 0 for lst in lists)
+    for i in range(max_len):
+        yield tuple(None if lst is None else (lst[0] if len(lst) == 1 else lst[i]) for lst in lists)
+
+
+# ---------------------------------------------------------------类型 开始----------------------------------------------------------------------#
+
+class String(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="string",
+            display_name="String",
+            category="工具",
+            inputs=[io.String.Input("value", default="")],
+            outputs=[io.String.Output("string")],
+        )
+
+    @classmethod
+    def execute(cls, value):
+        return io.NodeOutput(value)
+
+
+class Int(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="int",
+            display_name="Int",
+            category="工具",
+            inputs=[io.Int.Input("value", default=0, min=-999999, max=999999)],
+            outputs=[io.Int.Output("int")],
+        )
+
+    @classmethod
+    def execute(cls, value):
+        return io.NodeOutput(value)
+
+
+class RangeInt(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="rangeInt",
+            display_name="Range(Int)",
+            category="工具",
+            is_input_list=True,
+            inputs=[
+                io.Combo.Input("range_mode", options=["step", "num_steps"], default="step"),
+                io.Int.Input("start", default=0, min=-4096, max=4096, step=1),
+                io.Int.Input("stop", default=1, min=-4096, max=4096, step=1),
+                io.Int.Input("step", default=1, min=-4096, max=4096, step=1),
+                io.Int.Input("num_steps", default=0, min=-4096, max=4096, step=1),
+                io.Combo.Input("end_mode", options=["Inclusive", "Exclusive"], default="Inclusive"),
+            ],
+            outputs=[
+                io.Int.Output("range", is_output_list=True),
+                io.Int.Output("range_sizes", is_output_list=True),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, range_mode, start, stop, step, num_steps, end_mode):
+        input_args = {k: v for k, v in locals().items() if k not in ("self", "cls")}
+        error_if_mismatched_list_args(input_args)
+        ranges = []
+        range_sizes = []
+        for rm, e_start, e_stop, e_num_steps, e_step, e_end_mode in zip_with_fill(
+                range_mode, start, stop, num_steps, step, end_mode
+        ):
+            if rm == "step":
+                if e_step == 0:
+                    vals = [e_start]
+                else:
+                    if e_end_mode == "Inclusive":
+                        e_stop += 1
+                    vals = list(range(e_start, e_stop, e_step))
+                ranges.extend(vals)
+                range_sizes.append(len(vals))
+            elif rm == "num_steps":
+                direction = 1 if e_stop > e_start else -1
+                if e_end_mode == "Exclusive":
+                    e_stop -= direction
+                vals = (np.rint(np.linspace(e_start, e_stop, e_num_steps)).astype(int).tolist())
+                ranges.extend(vals)
+                range_sizes.append(len(vals))
+        return io.NodeOutput(ranges, range_sizes)
+
+
+class Float(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="float",
+            display_name="Float",
+            category="工具",
+            inputs=[io.Float.Input("value", default=0, step=0.01, min=-0xffffffffffffffff, max=0xffffffffffffffff)],
+            outputs=[io.Float.Output("float")],
+        )
+
+    @classmethod
+    def execute(cls, value):
+        return io.NodeOutput(round(value, 3))
+
+
+class RangeFloat(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="rangeFloat",
+            display_name="Range(Float)",
+            category="工具",
+            is_input_list=True,
+            inputs=[
+                io.Combo.Input("range_mode", options=["step", "num_steps"], default="step"),
+                io.Float.Input("start", default=0, min=-4096, max=4096, step=0.1),
+                io.Float.Input("stop", default=1.0, min=-4096, max=4096, step=0.1),
+                io.Float.Input("step", default=1.0, min=-4096, max=4096, step=0.1),
+                io.Int.Input("num_steps", default=1, min=-4096, max=4096, step=1),
+                io.Combo.Input("end_mode", options=["Inclusive", "Exclusive"], default="Inclusive"),
+            ],
+            outputs=[
+                io.Float.Output("range", is_output_list=True),
+                io.Int.Output("range_sizes", is_output_list=True),
+            ],
+        )
+
+    @staticmethod
+    def _decimal_range(range_mode, start, stop, step, num_steps, inclusive):
+        if range_mode == "step":
+            ret_val = start
+            if inclusive:
+                stop = stop + step
+            direction = 1 if step > 0 else -1
+            while (ret_val - stop) * direction < 0:
+                yield float(ret_val)
+                ret_val += step
+        elif range_mode == "num_steps":
+            if num_steps is None or num_steps <= 0:
+                return
+            if num_steps == 1:
+                yield float(start)
+                return
+            if inclusive:
+                s = (stop - start) / Decimal(num_steps - 1)
+                for i in range(num_steps):
+                    yield float(stop if i == num_steps - 1 else (start + s * Decimal(i)))
+            else:
+                s = (stop - start) / Decimal(num_steps)
+                for i in range(num_steps):
+                    yield float(start + s * Decimal(i))
+
+    @classmethod
+    def execute(cls, range_mode, start, stop, step, num_steps, end_mode):
+        input_args = {k: v for k, v in locals().items() if k not in ("self", "cls")}
+        error_if_mismatched_list_args(input_args)
+        getcontext().prec = 12
+        start = [round(Decimal(s), 2) for s in start]
+        stop = [round(Decimal(s), 2) for s in stop]
+        step = [round(Decimal(s), 2) for s in step]
+        ranges = []
+        range_sizes = []
+        for rm, e_start, e_stop, e_step, e_num_steps, e_end_mode in zip_with_fill(
+                range_mode, start, stop, step, num_steps, end_mode
+        ):
+            vals = list(cls._decimal_range(rm, e_start, e_stop, e_step, e_num_steps, e_end_mode == "Inclusive"))
+            ranges.extend(vals)
+            range_sizes.append(len(vals))
+        return io.NodeOutput(ranges, range_sizes)
+
+
+class Boolean(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="boolean",
+            display_name="Boolean",
+            category="工具",
+            inputs=[io.Boolean.Input("value", default=False)],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, value):
+        return io.NodeOutput(value)
+
+
+# ---------------------------------------------------------------开关 开始----------------------------------------------------------------------#
+
+class imageSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="imageSwitch",
+            display_name="Image Switch",
+            category="工具",
+            inputs=[
+                io.Image.Input("image_a"),
+                io.Image.Input("image_b"),
+                io.Boolean.Input("boolean", default=False),
+            ],
+            outputs=[io.Image.Output("IMAGE")],
+        )
+
+    @classmethod
+    def execute(cls, image_a, image_b, boolean):
+        return io.NodeOutput(image_a if boolean else image_b)
+
+
+class textSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="textSwitch",
+            display_name="Text Switch",
+            category="工具",
+            inputs=[
+                io.Int.Input("input", default=1, min=1, max=2),
+                io.String.Input("text1", force_input=True, optional=True),
+                io.String.Input("text2", force_input=True, optional=True),
+            ],
+            outputs=[io.String.Output("STRING")],
+        )
+
+    @classmethod
+    def execute(cls, input, text1=None, text2=None):
+        return io.NodeOutput(text1 if input == 1 else text2)
+
+
+# ---------------------------------------------------------------Index Switch----------------------------------------------------------------------#
+
+class ab(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ab",
+            display_name="A or B",
+            category="工具",
+            inputs=[
+                io.Boolean.Input("A or B", default=True, label_on="A", label_off="B"),
+                io.AnyType.Input("in"),
+            ],
+            outputs=[
+                io.AnyType.Output("A"),
+                io.AnyType.Output("B"),
+            ],
+            hidden=[io.Hidden.unique_id],
+        )
+
+    @classmethod
+    def blocker(cls, value, block=False):
+        from comfy_execution.graph import ExecutionBlocker
+        return ExecutionBlocker(None) if block else value
+
+    @classmethod
+    def execute(cls, **kwargs):
+        is_a = kwargs["A or B"]
+        a = cls.blocker(kwargs["in"], not is_a)
+        b = cls.blocker(kwargs["in"], is_a)
+        return io.NodeOutput(a, b)
+
+
+class anythingInversedSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="anythingInversedSwitch",
+            display_name="Any Inversed Switch",
+            category="工具",
+            inputs=[
+                io.Int.Input("index", default=0, min=0, max=9, step=1),
+                io.AnyType.Input("in"),
+            ],
+            outputs=[io.AnyType.Output("out%d" % i) for i in range(MAX_FLOW_NUM)],
+            hidden=[io.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, index, **kwargs):
+        from comfy_execution.graph import ExecutionBlocker
+        res = [kwargs["in"] if index == i else ExecutionBlocker(None) for i in range(MAX_FLOW_NUM)]
+        return io.NodeOutput(*res)
+
+
+class anythingIndexSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        inputs = [io.Int.Input("index", default=0, min=0, max=9, step=1)]
+        for i in range(MAX_FLOW_NUM):
+            inputs.append(io.AnyType.Input("value%d" % i, optional=True, lazy=True))
+        return io.Schema(
+            node_id="anythingIndexSwitch",
+            display_name="Any Index Switch",
+            category="工具",
+            inputs=inputs,
+            outputs=[io.AnyType.Output("value")],
+        )
+
+    @classmethod
+    def check_lazy_status(cls, index, **kwargs):
+        key = "value%d" % index
+        if kwargs.get(key, None) is None:
+            return [key]
+
+    @classmethod
+    def execute(cls, index, **kwargs):
+        return io.NodeOutput(kwargs["value%d" % index])
+
+
+class imageIndexSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        inputs = [io.Int.Input("index", default=0, min=0, max=9, step=1)]
+        for i in range(MAX_FLOW_NUM):
+            inputs.append(io.Image.Input("image%d" % i, optional=True, lazy=True))
+        return io.Schema(
+            node_id="imageIndexSwitch",
+            display_name="Image Index Switch",
+            category="工具",
+            inputs=inputs,
+            outputs=[io.Image.Output("image")],
+        )
+
+    @classmethod
+    def check_lazy_status(cls, index, **kwargs):
+        key = "image%d" % index
+        if kwargs.get(key, None) is None:
+            return [key]
+
+    @classmethod
+    def execute(cls, index, **kwargs):
+        return io.NodeOutput(kwargs["image%d" % index])
+
+
+class textIndexSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        inputs = [io.Int.Input("index", default=0, min=0, max=9, step=1)]
+        for i in range(MAX_FLOW_NUM):
+            inputs.append(io.String.Input("text%d" % i, optional=True, lazy=True, force_input=True))
+        return io.Schema(
+            node_id="textIndexSwitch",
+            display_name="Text Index Switch",
+            category="工具",
+            inputs=inputs,
+            outputs=[io.String.Output("text")],
+        )
+
+    @classmethod
+    def check_lazy_status(cls, index, **kwargs):
+        key = "text%d" % index
+        if kwargs.get(key, None) is None:
+            return [key]
+
+    @classmethod
+    def execute(cls, index, **kwargs):
+        return io.NodeOutput(kwargs["text%d" % index])
+
+
+class conditioningIndexSwitch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        inputs = [io.Int.Input("index", default=0, min=0, max=9, step=1)]
+        for i in range(MAX_FLOW_NUM):
+            inputs.append(io.Conditioning.Input("cond%d" % i, optional=True, lazy=True))
+        return io.Schema(
+            node_id="conditioningIndexSwitch",
+            display_name="Conditioning Index Switch",
+            category="工具",
+            inputs=inputs,
+            outputs=[io.Conditioning.Output("conditioning")],
+        )
+
+    @classmethod
+    def check_lazy_status(cls, index, **kwargs):
+        key = "cond%d" % index
+        if kwargs.get(key, None) is None:
+            return [key]
+
+    @classmethod
+    def execute(cls, index, **kwargs):
+        return io.NodeOutput(kwargs["cond%d" % index])
+
+
+# ---------------------------------------------------------------Math----------------------------------------------------------------------#
+
+class mathIntOperation(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="mathInt",
+            display_name="Math Int",
+            category="工具",
+            inputs=[
+                io.Int.Input("a", default=0, min=-0xffffffffffffffff, max=0xffffffffffffffff, step=1),
+                io.Int.Input("b", default=0, min=-0xffffffffffffffff, max=0xffffffffffffffff, step=1),
+                io.Combo.Input("operation", options=["add", "subtract", "multiply", "divide", "modulo", "power"]),
+            ],
+            outputs=[io.Int.Output("INT")],
+        )
+
+    @classmethod
+    def execute(cls, a, b, operation):
+        ops = {
+            "add": lambda: a + b, "subtract": lambda: a - b, "multiply": lambda: a * b,
+            "divide": lambda: a // b, "modulo": lambda: a % b, "power": lambda: a ** b,
+        }
+        return io.NodeOutput(ops[operation]())
+
+
+class mathFloatOperation(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="mathFloat",
+            display_name="Math Float",
+            category="工具",
+            inputs=[
+                io.Float.Input("a", default=0, min=-999999999999.0, max=999999999999.0, step=0.01),
+                io.Float.Input("b", default=0, min=-999999999999.0, max=999999999999.0, step=0.01),
+                io.Combo.Input("operation", options=["add", "subtract", "multiply", "divide", "modulo", "power"]),
+            ],
+            outputs=[io.Float.Output("FLOAT")],
+        )
+
+    @classmethod
+    def execute(cls, a, b, operation):
+        ops = {
+            "add": lambda: round(a + b, 3), "subtract": lambda: round(a - b, 3), "multiply": lambda: round(a * b, 3),
+            "divide": lambda: round(a / b, 3), "modulo": lambda: round(a % b, 3), "power": lambda: round(a ** b, 3),
+        }
+        return io.NodeOutput(ops[operation]())
+
+
+class mathStringOperation(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="mathString",
+            display_name="Math String",
+            category="工具",
+            inputs=[
+                io.String.Input("a", multiline=False),
+                io.String.Input("b", multiline=False),
+                io.Combo.Input("operation", options=["a == b", "a != b", "a IN b", "a MATCH REGEX(b)", "a BEGINSWITH b", "a ENDSWITH b"]),
+                io.Boolean.Input("case_sensitive", default=True),
+            ],
+            outputs=[io.Boolean.Output("BOOLEAN")],
+        )
+
+    @classmethod
+    def execute(cls, a, b, operation, case_sensitive):
+        if not case_sensitive:
+            a = a.lower()
+            b = b.lower()
+        if operation == "a == b":
+            return io.NodeOutput(a == b)
+        elif operation == "a != b":
+            return io.NodeOutput(a != b)
+        elif operation == "a IN b":
+            return io.NodeOutput(a in b)
+        elif operation == "a MATCH REGEX(b)":
+            try:
+                return io.NodeOutput(re.match(b, a) is not None)
+            except Exception:
+                return io.NodeOutput(False)
+        elif operation == "a BEGINSWITH b":
+            return io.NodeOutput(a.startswith(b))
+        elif operation == "a ENDSWITH b":
+            return io.NodeOutput(a.endswith(b))
+
+
+class simpleMath(io.ComfyNode):
+    """简单计算器节点，支持字符串数学公式计算"""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="simpleMath",
+            display_name="Simple Math",
+            category="工具",
+            inputs=[
+                io.String.Input("value", default="", placeholder="输入数学公式，如: a + b, pow(a, 2), ceil(a / b), floor(a * b), round(a / b, 2)"),
+                io.AnyType.Input("a", optional=True),
+                io.AnyType.Input("b", optional=True),
+                io.AnyType.Input("c", optional=True),
+            ],
+            outputs=[
+                io.Int.Output("int"),
+                io.Float.Output("float"),
+                io.Boolean.Output("boolean"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, value, a=0, b=0, c=0):
+        try:
+            result = evaluate_formula(value, a, b, c)
+            if isinstance(result, list):
+                result_int = [int(r) for r in result]
+                return io.NodeOutput(result_int, result, [r != 0 for r in result])
+            result_int = int(result)
+            return io.NodeOutput(result_int, result, result_int != 0)
+        except Exception as e:
+            log_node_warn(f"计算错误: {str(e)}")
+            return io.NodeOutput(0, 0.0, False)
+
+
+class simpleMathDual(io.ComfyNode):
+    """双公式计算器节点，支持两个独立的数学公式计算"""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="simpleMathDual",
+            display_name="Simple Math Dual",
+            category="工具",
+            inputs=[
+                io.String.Input("value1", default="", placeholder="输入数学公式1，如: a + b, pow(a, 2), ceil(a / b)"),
+                io.String.Input("value2", default="", placeholder="输入数学公式2，如: c * d, sqrt(c), floor(d / 2)"),
+                io.AnyType.Input("a", optional=True),
+                io.AnyType.Input("b", optional=True),
+                io.AnyType.Input("c", optional=True),
+                io.AnyType.Input("d", optional=True),
+            ],
+            outputs=[
+                io.Int.Output("int1"),
+                io.Float.Output("float1"),
+                io.Int.Output("int2"),
+                io.Float.Output("float2"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, value1, value2, a=0, b=0, c=0, d=0):
+        try:
+            result1 = evaluate_formula(value1, a, b, c, d)
+            result1_int = [int(r) for r in result1] if isinstance(result1, list) else int(result1)
+        except Exception as e:
+            log_node_warn(f"公式1计算错误: {str(e)}")
+            result1 = 0.0
+            result1_int = 0
+        try:
+            result2 = evaluate_formula(value2, a, b, c, d)
+            result2_int = [int(r) for r in result2] if isinstance(result2, list) else int(result2)
+        except Exception as e:
+            log_node_warn(f"公式2计算错误: {str(e)}")
+            result2 = 0.0
+            result2_int = 0
+        return io.NodeOutput(result1_int, result1, result2_int, result2)
+
+
+# ---------------------------------------------------------------Flow----------------------------------------------------------------------#
+
+
+class WhileLoopStart(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="whileLoopStart",
+            display_name="While Loop Start",
+            category="工具",
+            description="标记循环体起点。condition 为 false 时跳过整个循环。",
+            inputs=[
+                io.Boolean.Input("condition", default=True),
+                *[io.AnyType.Input(f"initial_value{i}", optional=True) for i in range(MAX_FLOW_NUM)],
+            ],
+            outputs=[
+                io.Custom("FLOW_CONTROL").Output("flow"),
+                *[io.AnyType.Output(f"value{i}") for i in range(MAX_FLOW_NUM)],
+            ],
+        )
+
+    @classmethod
+    def execute(cls, condition, **kwargs):
+        values = []
+        for i in range(MAX_FLOW_NUM):
+            values.append(kwargs.get(f"initial_value{i}") if condition else ExecutionBlocker(None))
+        return io.NodeOutput("stub", *values)
+
+
+class WhileLoopEnd(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="whileLoopEnd",
+            display_name="While Loop End",
+            category="工具",
+            description="每轮检查 condition。为 true 时重复循环体，为 false 时输出本轮结果。",
+            inputs=[
+                io.Custom("FLOW_CONTROL").Input("flow", raw_link=True),
+                io.Boolean.Input("condition", force_input=True),
+                *[io.AnyType.Input(f"initial_value{i}", optional=True) for i in range(MAX_FLOW_NUM)],
+            ],
+            outputs=[io.AnyType.Output(f"value{i}") for i in range(MAX_FLOW_NUM)],
+            hidden=[io.Hidden.dynprompt, io.Hidden.unique_id],
+            enable_expand=True,
+        )
+
+    @classmethod
+    def explore_dependencies(cls, node_id, dynprompt, upstream, parent_ids):
+        node_info = dynprompt.get_node(node_id)
+        if "inputs" not in node_info:
+            return
+
+        for k, v in node_info["inputs"].items():
+            if is_link(v):
+                parent_id = v[0]
+                display_id = dynprompt.get_display_node_id(parent_id)
+                display_node = dynprompt.get_node(display_id)
+                class_type = display_node["class_type"]
+                if class_type not in ['forLoopEnd', 'whileLoopEnd']:
+                    parent_ids.append(display_id)
+                if parent_id not in upstream:
+                    upstream[parent_id] = []
+                    cls.explore_dependencies(parent_id, dynprompt, upstream, parent_ids)
+
+                upstream[parent_id].append(node_id)
+
+    @classmethod
+    def explore_output_nodes(cls, dynprompt, upstream, output_nodes, parent_ids):
+        for parent_id in upstream:
+            display_id = dynprompt.get_display_node_id(parent_id)
+            for output_id in output_nodes:
+                id = output_nodes[output_id][0]
+                if id in parent_ids and display_id == id and output_id not in upstream[parent_id]:
+                    if '.' in parent_id:
+                        arr = parent_id.split('.')
+                        arr[len(arr)-1] = output_id
+                        upstream[parent_id].append('.'.join(arr))
+                    else:
+                        upstream[parent_id].append(output_id)
+
+    @classmethod
+    def collect_contained(cls, node_id, upstream, contained):
+        if node_id not in upstream:
+            return
+        for child_id in upstream[node_id]:
+            if child_id not in contained:
+                contained[child_id] = True
+                cls.collect_contained(child_id, upstream, contained)
+
+    @classmethod
+    def execute(cls, flow, condition, **kwargs):
+        dynprompt = cls.hidden.dynprompt
+        unique_id = cls.hidden.unique_id
+        if not condition:
+            # We're done with the loop
+            values = []
+            for i in range(MAX_FLOW_NUM):
+                values.append(kwargs.get(f"initial_value{i}"))
+            return io.NodeOutput(*values)
+
+        # We want to loop
+        this_node = dynprompt.get_node(unique_id)
+        upstream = {}
+        # Get the list of all nodes between the open and close nodes
+        parent_ids = []
+        cls.explore_dependencies(unique_id, dynprompt, upstream, parent_ids)
+        parent_ids = list(set(parent_ids))
+        # Get the list of all output nodes between the open and close nodes
+        prompts = dynprompt.get_original_prompt()
+        output_nodes = {}
+        for id in prompts:
+            node = prompts[id]
+            if "inputs" not in node:
+                continue
+            class_type = node["class_type"]
+            class_def = ALL_NODE_CLASS_MAPPINGS[class_type]
+            if hasattr(class_def, 'OUTPUT_NODE') and class_def.OUTPUT_NODE == True:
+                for k, v in node['inputs'].items():
+                    if is_link(v):
+                        output_nodes[id] = v
+
+        graph = GraphBuilder()
+        cls.explore_output_nodes(dynprompt, upstream, output_nodes, parent_ids)
+        contained = {}
+        open_node = flow[0]
+        cls.collect_contained(open_node, upstream, contained)
+        contained[unique_id] = True
+        contained[open_node] = True
+
+        for node_id in contained:
+            original_node = dynprompt.get_node(node_id)
+            node = graph.node(original_node["class_type"], "Recurse" if node_id == unique_id else node_id)
+            node.set_override_display_id(node_id)
+        for node_id in contained:
+            original_node = dynprompt.get_node(node_id)
+            node = graph.lookup_node("Recurse" if node_id == unique_id else node_id)
+            for k, v in original_node["inputs"].items():
+                if is_link(v) and v[0] in contained:
+                    parent = graph.lookup_node(v[0])
+                    node.set_input(k, parent.out(v[1]))
+                else:
+                    node.set_input(k, v)
+
+        new_open = graph.lookup_node(open_node)
+        for i in range(MAX_FLOW_NUM):
+            key = f"initial_value{i}"
+            new_open.set_input(key, kwargs.get(key, None))
+        my_clone = graph.lookup_node("Recurse")
+        result = tuple(my_clone.out(i) for i in range(MAX_FLOW_NUM))
+        return io.NodeOutput(*result, expand=graph.finalize())
+
+
+class ForLoopStart(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="forLoopStart",
+            display_name="For Loop Start",
+            category="工具",
+            description="标记定长循环起点。index 从 initial_value0 开始递增。",
+            inputs=[
+                io.Int.Input("total", default=1, min=1, max=100000, step=1),
+                io.AnyType.Input("initial_value0", display_name="index", optional=True),
+                *[io.AnyType.Input(f"initial_value{i}", optional=True) for i in range(1, MAX_FLOW_NUM)],
+            ],
+            outputs=[
+                io.Custom("FLOW_CONTROL").Output("flow"),
+                io.Int.Output("index"),
+                *[io.AnyType.Output(f"value{i}") for i in range(1, MAX_FLOW_NUM)],
+            ],
+        )
+
+    @classmethod
+    def execute(cls, total, initial_value0=None, **kwargs):
+        graph = GraphBuilder()
+        i = 0
+        if initial_value0 is not None:
+            i = initial_value0
+
+        initial_values = {f"initial_value{num}": kwargs.get(f"initial_value{num}", None) for num in range(1, MAX_FLOW_NUM)}
+        while_open = graph.node("whileLoopStart", condition=total, initial_value0=i, **initial_values)
+        outputs = [kwargs.get(f"initial_value{num}", None) for num in range(1, MAX_FLOW_NUM)]
+        return io.NodeOutput("stub", i, *outputs, expand=graph.finalize())
+
+
+class ForLoopEnd(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="forLoopEnd",
+            display_name="For Loop End",
+            category="工具",
+            description="检查索引是否到达 total。未到时继续下一轮，到时输出结果。",
+            inputs=[
+                io.Custom("FLOW_CONTROL").Input("flow", raw_link=True),
+                *[io.AnyType.Input(f"initial_value{i}", raw_link=True, optional=True) for i in range(1, MAX_FLOW_NUM)],
+            ],
+            outputs=[io.AnyType.Output(f"value{i}") for i in range(1, MAX_FLOW_NUM)],
+            hidden=[io.Hidden.dynprompt, io.Hidden.unique_id],
+            enable_expand=True,
+        )
+
+    @classmethod
+    def execute(cls, flow, **kwargs):
+        dynprompt = cls.hidden.dynprompt
+        graph = GraphBuilder()
+        while_open = flow[0]
+        total = None
+
+        # Using dynprompt to get the original node
+        forstart_node = dynprompt.get_node(while_open)
+        if forstart_node['class_type'] == 'forLoopStart':
+            inputs = forstart_node['inputs']
+            total = inputs['total']
+        elif forstart_node['class_type'] == 'easy loadImagesForLoop':
+            inputs = forstart_node['inputs']
+            limit = inputs['limit']
+            start_index = inputs['start_index']
+            # Filter files by extension
+            directory = inputs['directory']
+            total = graph.node('easy imagesCountInDirectory', directory=directory, limit=limit, start_index=start_index, extension='*').out(0)
+
+        sub = graph.node("mathInt", operation="add", a=[while_open, 1], b=1)
+        cond = graph.node("compare", a=sub.out(0), b=total, comparison='a < b')
+        input_values = {f"initial_value{i}": kwargs.get(f"initial_value{i}", None) for i in range(1, MAX_FLOW_NUM)}
+        while_close = graph.node("whileLoopEnd",
+                                 flow=flow,
+                                 condition=cond.out(0),
+                                 initial_value0=sub.out(0),
+                                 **input_values)
+        result = tuple(while_close.out(i) for i in range(1, MAX_FLOW_NUM))
+        return io.NodeOutput(*result, expand=graph.finalize())
+
+
+COMPARE_FUNCTIONS = {
+    "a == b": lambda a, b: a == b,
+    "a != b": lambda a, b: a != b,
+    "a < b": lambda a, b: a < b,
+    "a > b": lambda a, b: a > b,
+    "a <= b": lambda a, b: a <= b,
+    "a >= b": lambda a, b: a >= b,
+    "a > 0": lambda a, b: a > 0,
+    "a <= 0": lambda a, b: a <= 0,
+    "b > 0": lambda a, b: b > 0,
+    "b <= 0": lambda a, b: b <= 0,
+}
+
+class Compare(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="compare",
+            display_name="Compare",
+            category="工具",
+            inputs=[
+                io.AnyType.Input("a", optional=True),
+                io.AnyType.Input("b", optional=True),
+                io.Combo.Input("comparison", options=list(COMPARE_FUNCTIONS.keys()), default="a == b", optional=True),
+            ],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, a=0, b=0, comparison="a == b"):
+        return io.NodeOutput(COMPARE_FUNCTIONS[comparison](a, b))
+
+
+class IfElse(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ifElse",
+            display_name="If else",
+            category="工具",
+            inputs=[
+                io.Boolean.Input("boolean"),
+                io.AnyType.Input("on_true", lazy=True),
+                io.AnyType.Input("on_false", lazy=True),
+            ],
+            outputs=[io.AnyType.Output("*")],
+        )
+
+    @classmethod
+    def check_lazy_status(cls, boolean=True, on_true=None, on_false=None):
+        if boolean and on_true is None:
+            return ["on_true"]
+        if not boolean and on_false is None:
+            return ["on_false"]
+
+    @classmethod
+    def execute(cls, **kwargs):
+        return io.NodeOutput(kwargs["on_true"] if kwargs["boolean"] else kwargs["on_false"])
+
+
+class Blocker(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="blocker",
+            display_name="Blocker",
+            category="工具",
+            inputs=[
+                io.Boolean.Input("continue", default=False),
+                io.AnyType.Input("in",),
+            ],
+            outputs=[io.AnyType.Output("out")],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        from comfy_execution.graph import ExecutionBlocker
+        return io.NodeOutput(kwargs["in"] if kwargs["continue"] else ExecutionBlocker(None))
+
+
+class isMaskEmpty(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="isMaskEmpty",
+            display_name="Is Mask Empty",
+            category="工具",
+            inputs=[io.Mask.Input("mask")],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, mask):
+        if mask is None or torch.all(mask == 0):
+            return io.NodeOutput(True)
+        return io.NodeOutput(False)
+
+
+class isNone(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="isNone",
+            display_name="Is None",
+            category="工具",
+            inputs=[io.AnyType.Input("any")],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, any):
+        result = (isinstance(any, str) and any == "") or \
+                 (isinstance(any, (int, float)) and any == 0) or \
+                 any is None
+        return io.NodeOutput(result)
+
+
+class isSDXL(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="isSDXL",
+            display_name="Is SDXL",
+            category="工具",
+            inputs=[
+                io.Custom(io_type="PIPE_LINE").Input("optional_pipe", optional=True),
+                io.Clip.Input("optional_clip", optional=True),
+            ],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, optional_pipe=None, optional_clip=None):
+        if optional_pipe is None and optional_clip is None:
+            raise Exception("[ERROR] optional_pipe or optional_clip is missing")
+        clip = optional_clip if optional_clip is not None else optional_pipe["clip"]
+        return io.NodeOutput(isinstance(clip.cond_stage_model, (SDXLClipModel, SDXLRefinerClipModel, SDXLClipG)))
+
+
+class isFileExist(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="isFileExist",
+            display_name="Is File Exist",
+            category="工具",
+            inputs=[
+                io.String.Input("file_path", default=""),
+                io.String.Input("file_name", default=""),
+                io.String.Input("file_extension", default=""),
+            ],
+            outputs=[io.Boolean.Output("boolean")],
+        )
+
+    @classmethod
+    def execute(cls, file_path, file_name, file_extension):
+        if not file_path:
+            raise Exception("file_path is missing")
+        if file_name:
+            file_path = os.path.join(file_path, file_name)
+        if file_extension:
+            file_path = file_path + "." + file_extension
+        return io.NodeOutput(os.path.exists(file_path) and os.path.isfile(file_path))
+
+
+class pixels(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        resolution_strings = [
+            f"{width} x {height} (custom)" if width == "width" and height == "height" else f"{width} x {height}"
+            for width, height in BASE_RESOLUTIONS
+        ]
+        return io.Schema(
+            node_id="pixels",
+            display_name="Pixels W/H Norm",
+            category="工具",
+            inputs=[
+                io.Combo.Input("resolution", options=resolution_strings),
+                io.Int.Input("width", default=512, min=64, max=MAX_RESOLUTION, step=8),
+                io.Int.Input("height", default=512, min=64, max=MAX_RESOLUTION, step=8),
+                io.Float.Input("scale", default=2.000, min=0.001, max=10, step=0.001),
+                io.Boolean.Input("flip_w/h", default=False),
+            ],
+            outputs=[
+                io.Int.Output("width_norm"),
+                io.Int.Output("height_norm"),
+                io.AnyType.Output("width"),
+                io.AnyType.Output("height"),
+                io.AnyType.Output("scale_factor"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, resolution, width, height, scale, **kwargs):
+        if resolution not in ["自定义 x 自定义", "width x height (custom)"]:
+            try:
+                _width, _height = map(int, resolution.split(" x "))
+                width = _width
+                height = _height
+            except ValueError:
+                raise ValueError("Invalid base_resolution format.")
+        width = width * scale
+        height = height * scale
+        width_norm = int(width - width % 8)
+        height_norm = int(height - height % 8)
+        if kwargs.get("flip_w/h", False):
+            width, height = height, width
+            width_norm, height_norm = height_norm, width_norm
+        return io.NodeOutput(width_norm, height_norm, width, height, scale)
+
+
+class xyAny(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="xyAny",
+            display_name="XY Any",
+            category="工具",
+            is_input_list=True,
+            inputs=[
+                io.AnyType.Input("X"),
+                io.AnyType.Input("Y"),
+                io.Combo.Input("direction", options=["horizontal", "vertical"], default="horizontal"),
+            ],
+            outputs=[
+                io.AnyType.Output("X", is_output_list=True),
+                io.AnyType.Output("Y", is_output_list=True),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, X, Y, direction):
+        new_x, new_y = [], []
+        if direction[0] == "horizontal":
+            for y in Y:
+                for x in X:
+                    new_x.append(x)
+                    new_y.append(y)
+        else:
+            for x in X:
+                for y in Y:
+                    new_x.append(x)
+                    new_y.append(y)
+        return io.NodeOutput(new_x, new_y)
+
+
+class lengthAnything(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="lengthAnything",
+            display_name="Length Any",
+            category="工具",
+            is_input_list=True,
+            inputs=[io.AnyType.Input("any")],
+            outputs=[io.Int.Output("length")],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, any, **kwargs):
+        prompt = cls.hidden.prompt
+        my_unique_id = cls.hidden.unique_id
+        if isinstance(prompt, list):
+            prompt = prompt[0]
+        if isinstance(my_unique_id, list):
+            my_unique_id = my_unique_id[0]
+        my_unique_id = my_unique_id.split(".")[-1] if "." in my_unique_id else my_unique_id
+        id, slot = prompt[my_unique_id]["inputs"]["any"]
+        class_type = prompt[id]["class_type"]
+        node_class = ALL_NODE_CLASS_MAPPINGS[class_type]
+        output_is_list = node_class.OUTPUT_IS_LIST[slot] if hasattr(node_class, "OUTPUT_IS_LIST") else False
+        return io.NodeOutput(len(any) if output_is_list or len(any) > 1 else len(any[0]))
+
+
+class indexAnything(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="indexAnything",
+            display_name="Index Any",
+            category="工具",
+            is_input_list=True,
+            inputs=[
+                io.AnyType.Input("any"),
+                io.Int.Input("index", default=0, min=-1000000, max=1000000, step=1),
+            ],
+            outputs=[io.AnyType.Output("out")],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, any, index, **kwargs):
+        if isinstance(index, list):
+            index = index[0]
+        prompt = cls.hidden.prompt
+        my_unique_id = cls.hidden.unique_id
+        if isinstance(prompt, list):
+            prompt = prompt[0]
+        if isinstance(my_unique_id, list):
+            my_unique_id = my_unique_id[0]
+        my_unique_id = my_unique_id.split(".")[-1] if "." in my_unique_id else my_unique_id
+        id, slot = prompt[my_unique_id]["inputs"]["any"]
+        class_type = prompt[id]["class_type"]
+        node_class = ALL_NODE_CLASS_MAPPINGS[class_type]
+        output_is_list = node_class.OUTPUT_IS_LIST[slot] if hasattr(node_class, "OUTPUT_IS_LIST") else False
+
+        def normalize_index(idx, length):
+            if idx < 0:
+                idx = length + idx
+            return min(max(0, idx), length - 1)
+
+        if output_is_list or len(any) > 1:
+            return io.NodeOutput(any[normalize_index(index, len(any))])
+        elif isinstance(any[0], torch.Tensor):
+            idx = normalize_index(index, any[0].shape[0])
+            return io.NodeOutput(any[0][idx:idx+1].clone())
+        else:
+            if hasattr(any[0], "__len__") and len(any[0]) > 0:
+                return io.NodeOutput(any[0][normalize_index(index, len(any[0]))])
+            return io.NodeOutput(any[0])
+
+
+class batchAnything(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="batchAnything",
+            display_name="Batch Any",
+            category="工具",
+            inputs=[
+                io.AnyType.Input("any_1"),
+                io.AnyType.Input("any_2"),
+            ],
+            outputs=[io.AnyType.Output("batch")],
+        )
+
+    @classmethod
+    def latentBatch(cls, any_1, any_2):
+        samples_out = any_1.copy()
+        s1 = any_1["samples"]
+        s2 = any_2["samples"]
+        if s1.shape[1:] != s2.shape[1:]:
+            s2 = comfy.utils.common_upscale(s2, s1.shape[3], s1.shape[2], "bilinear", "center")
+        s = torch.cat((s1, s2), dim=0)
+        samples_out["samples"] = s
+        samples_out["batch_index"] = any_1.get("batch_index", list(range(s1.shape[0]))) + \
+                                     any_2.get("batch_index", list(range(s2.shape[0])))
+        return samples_out
+
+    @classmethod
+    def execute(cls, any_1, any_2):
+        if isinstance(any_1, torch.Tensor) or isinstance(any_2, torch.Tensor):
+            if any_1 is None:
+                return io.NodeOutput(any_2)
+            if any_2 is None:
+                return io.NodeOutput(any_1)
+            if any_1.shape[1:] != any_2.shape[1:]:
+                any_2 = comfy.utils.common_upscale(any_2.movedim(-1, 1), any_1.shape[2], any_1.shape[1], "bilinear", "center").movedim(1, -1)
+            return io.NodeOutput(torch.cat((any_1, any_2), 0))
+        elif isinstance(any_1, (str, float, int)):
+            if any_2 is None:
+                return io.NodeOutput(any_1)
+            elif isinstance(any_2, tuple):
+                return io.NodeOutput(any_2 + (any_1,))
+            elif isinstance(any_2, list):
+                return io.NodeOutput(any_2 + [any_1])
+            return io.NodeOutput([any_1, any_2])
+        elif isinstance(any_2, (str, float, int)):
+            if any_1 is None:
+                return io.NodeOutput(any_2)
+            elif isinstance(any_1, tuple):
+                return io.NodeOutput(any_1 + (any_2,))
+            elif isinstance(any_1, list):
+                return io.NodeOutput(any_1 + [any_2])
+            return io.NodeOutput([any_2, any_1])
+        elif isinstance(any_1, dict) and "samples" in any_1:
+            if any_2 is None:
+                return io.NodeOutput(any_1)
+            if isinstance(any_2, dict) and "samples" in any_2:
+                return io.NodeOutput(cls.latentBatch(any_1, any_2))
+        elif isinstance(any_2, dict) and "samples" in any_2:
+            if any_1 is None:
+                return io.NodeOutput(any_2)
+            if isinstance(any_1, dict) and "samples" in any_1:
+                return io.NodeOutput(cls.latentBatch(any_2, any_1))
+        if any_1 is None:
+            return io.NodeOutput(any_2)
+        if any_2 is None:
+            return io.NodeOutput(any_1)
+        return io.NodeOutput(any_1 + any_2)
+
+
+class convertAnything(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="convertAnything",
+            display_name="Convert Any",
+            category="工具",
+            is_output_node=True,
+            inputs=[
+                io.AnyType.Input("*"),
+                io.Combo.Input("output_type", options=["string", "int", "float", "boolean"], default="string"),
+            ],
+            outputs=[io.AnyType.Output("output")],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        anything = kwargs["*"]
+        output_type = kwargs["output_type"]
+        converters = {"string": str, "int": int, "float": float, "boolean": bool}
+        return io.NodeOutput(converters[output_type](anything))
+
+
+class showAnything(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="showAnything",
+            display_name="Show Any",
+            category="工具",
+            is_input_list=True,
+            is_output_node=True,
+            inputs=[io.AnyType.Input("anything", optional=True)],
+            outputs=[io.AnyType.Output("output")],
+            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        unique_id = cls.hidden.unique_id
+        extra_pnginfo = cls.hidden.extra_pnginfo
+
+        values = []
+        if "anything" in kwargs:
+            for val in kwargs["anything"]:
+                if isinstance(val, str):
+                    values.append(val)
+                elif isinstance(val, (int, float, bool)):
+                    values.append(str(val))
+                elif isinstance(val, list) and len(val) <= 30:
+                    values = val
+                elif val is not None:
+                    try:
+                        values.append(json.dumps(val, indent=4, ensure_ascii=False))
+                    except Exception:
+                        try:
+                            values.append(str(val))
+                        except Exception:
+                            raise Exception("source exists, but could not be serialized.")
+
+        if extra_pnginfo and isinstance(extra_pnginfo, dict) and "workflow" in extra_pnginfo:
+            _uid = unique_id[0] if isinstance(unique_id, list) else unique_id
+            node = next((x for x in extra_pnginfo["workflow"]["nodes"] if str(x["id"]) == _uid), None)
+            if node:
+                node["widgets_values"] = [values]
+
+        result_val = values[0] if (isinstance(values, list) and len(values) == 1) else values
+        return io.NodeOutput(result_val, ui={"text": values})
+
+
+class showTensorShape(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="showTensorShape",
+            display_name="Show Tensor Shape",
+            category="工具",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("tensor")],
+            outputs=[],
+            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, tensor, **kwargs):
+        shapes = []
+
+        def tensorShape(t):
+            if isinstance(t, dict):
+                for k in t:
+                    tensorShape(t[k])
+            elif isinstance(t, list):
+                for item in t:
+                    tensorShape(item)
+            elif hasattr(t, "shape"):
+                shapes.append(list(t.shape))
+
+        tensorShape(tensor)
+        return io.NodeOutput(ui={"text": shapes})
+
+
+class stringToIntList(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="stringToIntList",
+            display_name="String to Int List",
+            category="工具",
+            inputs=[io.String.Input("string", default="1, 2, 3", multiline=True)],
+            outputs=[io.Int.Output("INT")],
+        )
+
+    @classmethod
+    def execute(cls, string):
+        return io.NodeOutput([int(x.strip()) for x in string.split(",")])
+
+
+class stringToFloatList(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="stringToFloatList",
+            display_name="String to Float List",
+            category="工具",
+            inputs=[io.String.Input("string", default="1, 2, 3", multiline=True)],
+            outputs=[io.Float.Output("FLOAT")],
+        )
+
+    @classmethod
+    def execute(cls, string):
+        return io.NodeOutput([float(x.strip()) for x in string.split(",")])
+
+
+class stringJoinLines(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="stringJoinLines",
+            display_name="String Join Lines",
+            category="工具",
+            inputs=[
+                io.String.Input("string", default="", multiline=True),
+                io.String.Input("delimiter", default=" | "),
+            ],
+            outputs=[io.String.Output("STRING")],
+        )
+
+    @classmethod
+    def execute(cls, string, delimiter):
+        lines = [line.strip() for line in string.split("\n") if line.strip()]
+        return io.NodeOutput(delimiter.join(lines))
+
+
+class outputToList(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="outputToList",
+            display_name="Output to List",
+            category="工具",
+            inputs=[io.AnyType.Input("tuple")],
+            outputs=[io.AnyType.Output("list", is_output_list=True)],
+        )
+
+    @classmethod
+    def execute(cls, tuple):
+        return io.NodeOutput(tuple)
+
+
+class cleanGPUUsed(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="cleanGpuUsed",
+            display_name="Clean VRAM Used",
+            category="工具",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("anything")],
+            outputs=[io.AnyType.Output("output")],
+            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, anything, **kwargs):
+        cleanGPUUsedForce()
+        return io.NodeOutput(anything)
+
+
+class clearCacheKey(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="clearCacheKey",
+            display_name="Clear Cache Key",
+            category="工具",
+            is_output_node=True,
+            inputs=[
+                io.AnyType.Input("anything"),
+                io.String.Input("cache_key", default="*"),
+            ],
+            outputs=[io.AnyType.Output("output")],
+            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, anything, cache_key, **kwargs):
+        remove_cache(cache_key)
+        return io.NodeOutput(anything)
+
+
+class clearCacheAll(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="clearCacheAll",
+            display_name="Clear Cache All",
+            category="工具",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("anything")],
+            outputs=[io.AnyType.Output("output")],
+            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, anything, **kwargs):
+        remove_cache("*")
+        return io.NodeOutput(anything)
+
+
+class saveText(io.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="saveText",
+            display_name="Save Text",
+            category="工具",
+            is_output_node=True,
+            inputs=[
+                io.String.Input("text", default="", force_input=True),
+                io.String.Input("output_file_path", multiline=False, default=""),
+                io.String.Input("file_name", multiline=False, default=""),
+                io.Combo.Input("file_extension", options=["txt", "csv"]),
+                io.Boolean.Input("overwrite", default=True),
+                io.Image.Input("image", optional=True),
+            ],
+            outputs=[
+                io.String.Output("text"),
+                io.Image.Output("image"),
+            ],
+        )
+
+    @classmethod
+    def save_image(cls, images, filename_prefix="", extension="png", quality=100, prompt=None,
+                   extra_pnginfo=None, delimiter="_", filename_number_start="true", number_padding=4,
+                   overwrite_mode="prefix_as_filename", output_path="", show_history="true",
+                   show_previews="true", embed_workflow="true", lossless_webp=False):
+        for image in images:
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            if extension == "webp":
+                img_exif = img.getexif()
+                workflow_metadata = ""
+                if prompt is not None:
+                    img_exif[0x010f] = "Prompt:" + json.dumps(prompt)
+                if extra_pnginfo is not None:
+                    for x in extra_pnginfo:
+                        workflow_metadata += json.dumps(extra_pnginfo[x])
+                img_exif[0x010e] = "Workflow:" + workflow_metadata
+                exif_data = img_exif.tobytes()
+            else:
+                metadata = PngInfo()
+                if embed_workflow == "true":
+                    if prompt is not None:
+                        metadata.add_text("prompt", json.dumps(prompt))
+                    if extra_pnginfo is not None:
+                        for x in extra_pnginfo:
+                            metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+                exif_data = metadata
+            file = f"{filename_prefix}.{extension}"
+            try:
+                output_file = os.path.abspath(os.path.join(output_path, file))
+                if extension in ["jpg", "jpeg"]:
+                    img.save(output_file, quality=quality, optimize=True)
+                elif extension == "webp":
+                    img.save(output_file, quality=quality, lossless=lossless_webp, exif=exif_data)
+                elif extension == "png":
+                    img.save(output_file, pnginfo=exif_data, optimize=True)
+                elif extension == "bmp":
+                    img.save(output_file)
+                elif extension == "tiff":
+                    img.save(output_file, quality=quality, optimize=True)
+                else:
+                    img.save(output_file, pnginfo=exif_data, optimize=True)
+            except Exception as e:
+                print(e)
+
+    @classmethod
+    def execute(cls, text, output_file_path, file_name, file_extension, overwrite, image=None, **kwargs):
+        if isinstance(file_name, list):
+            file_name = file_name[0]
+
+        if output_file_path == "" or file_name == "":
+            log_node_warn("Save Text", "No file details found. No file output.")
+            return io.NodeOutput(text, None)
+
+        filepath = os.path.join(output_file_path, file_name) + "." + file_extension
+        if not os.path.exists(output_file_path):
+            os.makedirs(output_file_path)
+
+        file_mode = "w" if overwrite else "a"
+        log_node_info("Save Text", f"Saving to {filepath}")
+
+        if file_extension == "csv":
+            with open(filepath, file_mode, newline="", encoding="utf-8") as csv_file:
+                csv_writer = csv.writer(csv_file)
+                for line in [i.strip() for i in text.split("\n")]:
+                    csv_writer.writerow([line])
+        else:
+            with open(filepath, file_mode, newline="", encoding="utf-8") as text_file:
+                for line in text:
+                    text_file.write(line)
+
+        result_image = None
+        if image is not None:
+            imagepath = os.path.join(output_file_path, file_name)
+            index = 1
+            if not overwrite:
+                while os.path.exists(filepath):
+                    imagepath = os.path.join(output_file_path, file_name) + "_" + str(index)
+                    index += 1
+
+            output_dir = folder_paths.output_directory
+            output_path_val = "" if output_file_path in [None, "", "none", "."] else output_file_path
+            if not os.path.isabs(output_file_path):
+                output_path_val = os.path.join(output_dir, output_path_val)
+            if output_path_val.strip():
+                if not os.path.isabs(output_path_val):
+                    output_path_val = os.path.join(folder_paths.output_directory, output_path_val)
+                if not os.path.exists(output_path_val.strip()):
+                    print(f"The path `{output_path_val.strip()}` does not exist! Creating directory.")
+                    os.makedirs(output_path_val, exist_ok=True)
+
+            images_tensor = torch.cat([image], dim=0)
+            cls.save_image(images_tensor, imagepath, "png", 100, None, None,
+                           filename_number_start="true", output_path=output_path_val,
+                           delimiter="_", number_padding=4, lossless_webp=False)
+            log_node_info("Save Text", f"Saving Image to {imagepath}")
+            result_image = image
+
+        return io.NodeOutput(text, result_image)
+
+
+class sleep(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="sleep",
+            display_name="Sleep",
+            category="工具",
+            inputs=[
+                io.AnyType.Input("any"),
+                io.Float.Input("delay", default=1.0, min=0.0, max=1000000, step=0.1),
+            ],
+            outputs=[io.AnyType.Output("out")],
+        )
+
+    @classmethod
+    def execute(cls, any, delay):
+        time.sleep(delay)
+        return io.NodeOutput(any)
+
+
+NODE_CLASS_MAPPINGS = {
+    "string": String,
+    "int": Int,
+    "rangeInt": RangeInt,
+    "float": Float,
+    "rangeFloat": RangeFloat,
+    "boolean": Boolean,
+    "mathString": mathStringOperation,
+    "mathInt": mathIntOperation,
+    "mathFloat": mathFloatOperation,
+    "simpleMath": simpleMath,
+    "simpleMathDual": simpleMathDual,
+    "compare": Compare,
+    "imageSwitch": imageSwitch,
+    "textSwitch": textSwitch,
+    "imageIndexSwitch": imageIndexSwitch,
+    "textIndexSwitch": textIndexSwitch,
+    "conditioningIndexSwitch": conditioningIndexSwitch,
+    "anythingIndexSwitch": anythingIndexSwitch,
+    "ab": ab,
+    "anythingInversedSwitch": anythingInversedSwitch,
+    "whileLoopStart": WhileLoopStart,
+    "whileLoopEnd": WhileLoopEnd,
+    "forLoopStart": ForLoopStart,
+    "forLoopEnd": ForLoopEnd,
+    "blocker": Blocker,
+    "ifElse": IfElse,
+    "isMaskEmpty": isMaskEmpty,
+    "isNone": isNone,
+    "isSDXL": isSDXL,
+    "isFileExist": isFileExist,
+    "stringToIntList": stringToIntList,
+    "stringToFloatList": stringToFloatList,
+    "stringJoinLines": stringJoinLines,
+    "outputToList": outputToList,
+    "pixels": pixels,
+    "xyAny": xyAny,
+    "lengthAnything": lengthAnything,
+    "indexAnything": indexAnything,
+    "batchAnything": batchAnything,
+    "convertAnything": convertAnything,
+    "showAnything": showAnything,
+    "showTensorShape": showTensorShape,
+    "clearCacheKey": clearCacheKey,
+    "clearCacheAll": clearCacheAll,
+    "cleanGpuUsed": cleanGPUUsed,
+    "saveText": saveText,
+    "sleep": sleep,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "string": "String",
+    "int": "Int",
+    "rangeInt": "Range(Int)",
+    "float": "Float",
+    "rangeFloat": "Range(Float)",
+    "boolean": "Boolean",
+    "compare": "Compare",
+    "mathString": "Math String",
+    "mathInt": "Math Int",
+    "mathFloat": "Math Float",
+    "simpleMath": "Simple Math",
+    "simpleMathDual": "Simple Math Dual",
+    "imageSwitch": "Image Switch",
+    "textSwitch": "Text Switch",
+    "imageIndexSwitch": "Image Index Switch",
+    "textIndexSwitch": "Text Index Switch",
+    "conditioningIndexSwitch": "Conditioning Index Switch",
+    "anythingIndexSwitch": "Any Index Switch",
+    "ab": "A or B",
+    "anythingInversedSwitch": "Any Inversed Switch",
+    "whileLoopStart": "While Loop Start",
+    "whileLoopEnd": "While Loop End",
+    "forLoopStart": "For Loop Start",
+    "forLoopEnd": "For Loop End",
+    "ifElse": "If else",
+    "blocker": "Blocker",
+    "isMaskEmpty": "Is Mask Empty",
+    "isNone": "Is None",
+    "isSDXL": "Is SDXL",
+    "isFileExist": "Is File Exist",
+    "stringToIntList": "String to Int List",
+    "stringToFloatList": "String to Float List",
+    "stringJoinLines": "String Join Lines",
+    "outputToList": "Output to List",
+    "pixels": "Pixels W/H Norm",
+    "xyAny": "XY Any",
+    "lengthAnything": "Length Any",
+    "indexAnything": "Index Any",
+    "batchAnything": "Batch Any",
+    "convertAnything": "Convert Any",
+    "showAnything": "Show Any",
+    "showTensorShape": "Show Tensor Shape",
+    "clearCacheKey": "Clear Cache Key",
+    "clearCacheAll": "Clear Cache All",
+    "cleanGpuUsed": "Clean VRAM Used",
+    "saveText": "Save Text",
+    "sleep": "Sleep",
+}

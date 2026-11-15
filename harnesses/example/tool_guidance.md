@@ -1,0 +1,2 @@
+- 需要原样回显文本时，调用 MCP 工具 `echo`。
+- 需要统计文本字数时，运行 `python scripts/word_count.py <文件>`。

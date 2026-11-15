@@ -1,0 +1,12 @@
+# Agent 节点读取本文件。只支持以下字段，全部可选。
+model: ""                 # 节点 model 选择 "(harness 默认)" 时使用。空字符串表示 SDK 默认模型。
+max_turns: 30
+timeout: 600              # 秒
+prompt_mode: append       # append：追加到 Claude Code 默认系统提示词。replace：完全替换。
+tools: [Read, Write, Bash] # 可用的内建工具，同时自动放行。有 skills 时节点自动加入 Skill，有 sub_agents 时自动加入 Agent。
+disallowed_tools: []
+add_dirs: []              # 工作区之外允许访问的目录
+# max_budget_usd: 1.0
+# output_format:
+#   type: json_schema
+#   schema: {type: object, properties: {answer: {type: string}}, required: [answer]}

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# ComfyUI runtime directories (when this package is copied into a ComfyUI tree)
+ComfyUI/
+input/
+output/
+models/
+user/
+temp/
+custom_nodes/ComfyUI-Manager/
+
+# Agent workspaces produced at runtime
+**/agent/
+**/trajectory/
+
+# Logs and OS/editor files
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
