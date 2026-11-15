@@ -13,12 +13,12 @@ harness 的组件划分来自论文 Harness²（arXiv 2610.14224）和 `personal
 3. 用户重启 ComfyUI，并刷新浏览器。
 
 ```bash
-/path/to/comfyui/python -m pip install -r /root/ComateProjects/chats/baidu/personal-code/icafe-autolabel/custom_nodes/general_cc_agent_node/requirements.txt
+/path/to/comfyui/python -m pip install -r /root/ComateProjects/chats/baidu/personal-code/general_comfyui_agent_node/custom_nodes/general_cc_agent_node/requirements.txt
 ```
 
 ## harness 目录
 
-harness 放在 `icafe-autolabel/harnesses/<名称>/`。只有包含 `harness.yaml` 的子目录会出现在下拉框中。
+harness 放在 `general_comfyui_agent_node/harnesses/<名称>/`。只有包含 `harness.yaml` 的子目录会出现在下拉框中。
 `harnesses/example/` 是完整示例。
 
 | 路径 | 组件 | 用法 |
@@ -82,8 +82,8 @@ harness 放在 `icafe-autolabel/harnesses/<名称>/`。只有包含 `harness.yam
 ## 离线测试
 
 ```bash
-cd /root/ComateProjects/chats/baidu/personal-code/icafe-autolabel/ComfyUI
-/root/ComateProjects/chats/baidu/personal-code/icafe-autolabel/tests/.venv/bin/python -I ../custom_nodes/general_cc_agent_node/tests/test_node.py
+cd /root/ComateProjects/chats/baidu/personal-code/general_comfyui_agent_node/ComfyUI
+/root/ComateProjects/chats/baidu/personal-code/general_comfyui_agent_node/tests/.venv/bin/python -I ../custom_nodes/general_cc_agent_node/tests/test_node.py
 ```
 
 测试使用真实 SDK 类型、ComfyUI V3 API 和本地 aiohttp 服务模拟 `/v1/models`。
